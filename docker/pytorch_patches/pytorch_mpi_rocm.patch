@@ -1,0 +1,434 @@
+diff --git a/torch/csrc/distributed/c10d/ProcessGroupMPI.cpp b/torch/csrc/distributed/c10d/ProcessGroupMPI.cpp
+index 91e9f938f1d..59fec3f6eb5 100644
+--- a/torch/csrc/distributed/c10d/ProcessGroupMPI.cpp
++++ b/torch/csrc/distributed/c10d/ProcessGroupMPI.cpp
+@@ -5,9 +5,18 @@
+ #include <iostream>
+ #include <map>
+ 
++#include <c10/core/DeviceType.h>
+ #include <c10/core/DeviceGuard.h>
+ #include <c10/util/irange.h>
+ 
++#if USE_CUDA
++#include <ATen/cuda/CUDAContext.h>
++#include <ATen/cuda/CUDAGraph.h>
++#include <c10/cuda/CUDAAllocatorConfig.h>
++#include <c10/cuda/CUDAGraphsC10Utils.h>
++#include <c10/cuda/CUDAGuard.h>
++#endif
++
+ #if defined(OPEN_MPI) && OPEN_MPI
+ #include <mpi-ext.h> // Needed for CUDA-aware check
+ #endif
+@@ -50,11 +59,7 @@ std::map<at::ScalarType, MPI_Datatype> mpiDatatype = {
+ bool cudaAwareMpiCheck() {
+ // Run time check
+ #if defined(MPIX_CUDA_AWARE_SUPPORT)
+-  if (MPIX_Query_cuda_support() == 1) {
+-    return true;
+-  } else {
+-    return false;
+-  }
++  return true;
+ #else // !defined(MPIX_CUDA_AWARE_SUPPORT)
+   return false;
+ #endif // MPIX_CUDA_AWARE_SUPPORT
+@@ -690,7 +695,214 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::reduce_scatter(
+     std::vector<at::Tensor>& outputTensors,
+     std::vector<std::vector<at::Tensor>>& inputTensors,
+     const ReduceScatterOptions& opts) {
+-  TORCH_CHECK(false, "ProcessGroupMPI does not support reduce_scatter");
++
++  // Ensure the output and input tensors have matching sizes
++  TORCH_CHECK(
++      outputTensors.size() == inputTensors.size(),
++      "Tensor input/output list for reduce_scatter must have the same size.");
++
++  checkSingleTensor(outputTensors);  // Verify we have a single tensor per rank
++
++  // Validate device and ensure each rank's input size matches world size
++  const auto worldSize = static_cast<int>(this->getSize());
++  const auto device = inputTensors[0][0].device();
++  for (size_t i = 0; i < inputTensors.size(); ++i) {
++    TORCH_CHECK(
++        inputTensors[i].size() == static_cast<size_t>(worldSize),
++        "Each input tensor list must have the same size as the world size.");
++    // Pass outputTensors as a vector to match checkSameSizeAndType’s argument requirements
++    checkSameSizeAndType(inputTensors[i][0], std::vector<at::Tensor>{outputTensors[i]});
++  }
++
++  // Map the reduce operation to MPI's ReduceOp
++  MPI_Op mpiReduceOp;
++  switch (opts.reduceOp) {
++    case ReduceOp::SUM:
++      mpiReduceOp = MPI_SUM;
++      break;
++    case ReduceOp::PRODUCT:
++      mpiReduceOp = MPI_PROD;
++      break;
++    case ReduceOp::MIN:
++      mpiReduceOp = MPI_MIN;
++      break;
++    case ReduceOp::MAX:
++      mpiReduceOp = MPI_MAX;
++      break;
++    default:
++      TORCH_CHECK(false, "Unsupported ReduceOp for MPI backend.");
++  }
++
++  // Flatten input tensors per rank into a single contiguous buffer
++  std::vector<at::Tensor> flatInput(inputTensors.size());
++  for (size_t i = 0; i < inputTensors.size(); i++) {
++    flatInput[i] = c10d::newLikeFlat(inputTensors, i); // Allocate a flat tensor
++  }
++
++  // Copy input tensors to flat input buffer
++  auto copyToFlat = [&]() {
++    bool asyncCopy = false;
++    for (size_t i = 0; i < inputTensors.size(); i++) {
++      auto onumel = outputTensors[i].numel();
++      for (size_t j = 0; j < inputTensors[i].size(); j++) {
++        TORCH_CHECK(
++            inputTensors[i][j].numel() == onumel,
++            "All input tensors for each rank must have the same number of elements.");
++        flatInput[i].copy_(inputTensors[i][j], asyncCopy);
++      }
++    }
++  };
++
++  // Run function for collective MPI_Reduce_scatter
++  std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
++      [this, &flatInput, &outputTensors, mpiReduceOp, device](std::unique_ptr<WorkEntry>& entry) {
++        c10::DeviceGuard guard(device);
++
++        // Number of elements in each output tensor
++        int outputNumel = outputTensors[0].numel();
++
++        if (device.is_cpu()) {
++          // Perform the ReduceScatter operation on CPU
++          MPI_CHECK(MPI_Reduce_scatter(
++              flatInput[0].data_ptr(),
++              outputTensors[0].data_ptr(),
++              &outputNumel,  // Pass address of the integer outputNumel
++              mpiDatatype.at(flatInput[0].scalar_type()),
++              mpiReduceOp,
++              pgComm_));
++        }
++#if USE_CUDA
++        else if (device.is_cuda()) {
++          // Perform ReduceScatter on CUDA with CUDA-aware MPI
++          at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(device.index());
++
++          // Record stream for each tensor to ensure correct memory management
++          for (const auto& tensor : flatInput) {
++            c10::cuda::CUDACachingAllocator::recordStream(
++                tensor.storage().data_ptr(), stream);
++          }
++          for (auto& tensor : outputTensors) {
++            c10::cuda::CUDACachingAllocator::recordStream(
++                tensor.storage().data_ptr(), stream);
++          }
++
++          MPI_CHECK(MPI_Reduce_scatter(
++              flatInput[0].data_ptr(),
++              outputTensors[0].data_ptr(),
++              &outputNumel,  // Pass address of the integer outputNumel
++              mpiDatatype.at(flatInput[0].scalar_type()),
++              mpiReduceOp,
++              pgComm_));
++        }
++#endif // USE_CUDA
++        else {
++          TORCH_CHECK(false, "Unsupported device type in MPI reduce_scatter. Only CPU and CUDA are supported.");
++        }
++      };
++
++  // Set up and enqueue the work entry for asynchronous execution
++  auto entry = std::make_unique<WorkEntry>(
++      &flatInput, // Flattened input tensors
++      &outputTensors, // Output tensors
++      std::move(runFunc));
++
++  return enqueue(
++      std::move(entry),
++      "mpi:reduce_scatter",
++      std::optional<std::vector<at::Tensor>>(flatInput));
++}
++
++c10::intrusive_ptr<Work> ProcessGroupMPI::_reduce_scatter_base(
++    at::Tensor& outputTensor,
++    at::Tensor& inputTensor,
++    const ReduceScatterOptions& opts) {
++
++  // Check that input and output tensors have matching types
++  TORCH_CHECK(
++      inputTensor.dtype() == outputTensor.dtype(),
++      "input tensor must be the same type as the output tensor.");
++
++  // Validate the input tensor size: it should be `world_size * outputTensor.numel()`
++  TORCH_CHECK(
++      inputTensor.numel() == outputTensor.numel() * size_,
++      "input tensor must be the same size as output tensor times world size.");
++
++  // Map the reduction operation to MPI's ReduceOp
++  MPI_Op mpiReduceOp;
++  switch (opts.reduceOp) {
++    case ReduceOp::SUM:
++      mpiReduceOp = MPI_SUM;
++      break;
++    case ReduceOp::PRODUCT:
++      mpiReduceOp = MPI_PROD;
++      break;
++    case ReduceOp::MIN:
++      mpiReduceOp = MPI_MIN;
++      break;
++    case ReduceOp::MAX:
++      mpiReduceOp = MPI_MAX;
++      break;
++    default:
++      TORCH_CHECK(false, "Unsupported ReduceOp for MPI backend.");
++  }
++
++  // Set up the function that will perform the MPI_Reduce_scatter operation
++  std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
++      [this, &inputTensor, &outputTensor, mpiReduceOp](std::unique_ptr<WorkEntry>& entry) {
++        c10::Device device = inputTensor.device();
++        c10::DeviceGuard guard(device);
++
++        int outputNumel = outputTensor.numel();
++
++        if (device.is_cpu()) {
++          // Perform reduce-scatter on CPU
++          MPI_CHECK(MPI_Reduce_scatter(
++              inputTensor.data_ptr(),
++              outputTensor.data_ptr(),
++              &outputNumel,  // Pass the address of outputNumel
++              mpiDatatype.at(inputTensor.scalar_type()),
++              mpiReduceOp,
++              pgComm_));
++        }
++#if USE_CUDA
++        else if (device.is_cuda()) {
++          // GPU-based MPI_Reduce_scatter with CUDA-aware MPI
++          at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(device.index());
++
++          // Synchronize input and output tensors with the current CUDA stream
++          c10::cuda::CUDACachingAllocator::recordStream(
++              inputTensor.storage().data_ptr(), stream);
++          c10::cuda::CUDACachingAllocator::recordStream(
++              outputTensor.storage().data_ptr(), stream);
++
++          MPI_CHECK(MPI_Reduce_scatter(
++              inputTensor.data_ptr(),
++              outputTensor.data_ptr(),
++              &outputNumel,  // Pass the address of outputNumel
++              mpiDatatype.at(inputTensor.scalar_type()),
++              mpiReduceOp,
++              pgComm_));
++        }
++#endif 
++        else {
++          TORCH_CHECK(false, "Unsupported device type in MPI reduce_scatter_base. Only CPU and CUDA are supported.");
++        }
++      };
++
++  // Create named vectors for input and output tensors to avoid the rvalue error
++  auto inputVector = std::vector<at::Tensor>{inputTensor};
++  auto outputVector = std::vector<at::Tensor>{outputTensor};
++
++  // Create a WorkEntry and enqueue it for execution, passing pointers to the named vectors
++  auto entry = std::make_unique<WorkEntry>(
++      &inputVector,  // Pass pointer to the input vector
++      &outputVector, // Pass pointer to the output vector
++      std::move(runFunc));
++
++  return enqueue(
++      std::move(entry),
++      "mpi:reduce_scatter_base",
++      std::optional<std::vector<at::Tensor>>({inputTensor}));
+ }
+ 
+ c10::intrusive_ptr<Work> ProcessGroupMPI::alltoall_base(
+@@ -935,13 +1147,93 @@ c10::intrusive_ptr<Work> ProcessGroupMPI::barrier(const BarrierOptions& opts) {
+   return enqueue(std::move(entry), "mpi:barrier", std::nullopt);
+ }
+ 
++// c10::intrusive_ptr<Work> ProcessGroupMPI::_allgather_base(
++//     at::Tensor& /*unused */,
++//     at::Tensor& /*unused */,
++//     const AllgatherOptions& /*unused */) {
++//   TORCH_CHECK(false, "no support for _allgather_base in MPI process group");
++// }
+ c10::intrusive_ptr<Work> ProcessGroupMPI::_allgather_base(
+-    at::Tensor& /*unused */,
+-    at::Tensor& /*unused */,
+-    const AllgatherOptions& /*unused */) {
+-  TORCH_CHECK(false, "no support for _allgather_base in MPI process group");
++    at::Tensor& outputTensor,
++    at::Tensor& inputTensor,
++    const AllgatherOptions& opts) {
++
++  // Check if tensors are on the same device and have the same type
++  checkSameSizeAndType(inputTensor, std::vector<at::Tensor>{outputTensor});
++
++  // Ensure output tensor has the expected size for an all-gather operation
++  if (inputTensor.numel() * size_ != outputTensor.numel()) {
++    TORCH_CHECK(
++        false,
++        "Output tensor size must be equal to world_size times input tensor size");
++  }
++
++  // Create vectors for input and output tensors
++  std::vector<at::Tensor> inputTensors = {inputTensor};
++  std::vector<at::Tensor> outputTensors = {outputTensor};
++
++  // Set up the function that will perform the MPI_Allgather operation
++  std::function<void(std::unique_ptr<WorkEntry>&)> runFunc =
++      [this, &inputTensor, &outputTensor](std::unique_ptr<WorkEntry>& entry) {
++        c10::Device device = inputTensor.device();
++        c10::DeviceGuard guard(device);
++
++        // Choose between CPU and GPU implementation
++        if (device.is_cpu()) {
++          // Perform MPI all-gather on CPU
++          MPI_CHECK(MPI_Allgather(
++              inputTensor.data_ptr(),
++              inputTensor.numel(),
++              mpiDatatype.at(inputTensor.scalar_type()),
++              outputTensor.data_ptr(),
++              inputTensor.numel(),
++              mpiDatatype.at(outputTensor.scalar_type()),
++              pgComm_));
++        } 
++#ifdef USE_CUDA
++        else if (device.is_cuda()) {
++          // GPU-based MPI_Allgather using CUDA-aware MPI
++          at::cuda::CUDAStream stream = at::cuda::getCurrentCUDAStream(device.index());
++
++          // Synchronize input tensor to ensure it's ready on the device
++          c10::cuda::CUDACachingAllocator::recordStream(
++              inputTensor.storage().data_ptr(), stream);
++
++          // Perform MPI all-gather
++          MPI_CHECK(MPI_Allgather(
++              inputTensor.data_ptr(),
++              inputTensor.numel(),
++              mpiDatatype.at(inputTensor.scalar_type()),
++              outputTensor.data_ptr(),
++              inputTensor.numel(),
++              mpiDatatype.at(outputTensor.scalar_type()),
++              pgComm_));
++
++          // Record stream usage for output tensor to ensure data consistency
++          c10::cuda::CUDACachingAllocator::recordStream(
++              outputTensor.storage().data_ptr(), stream);
++        } 
++#endif
++        else {
++          TORCH_CHECK(
++              false,
++              "Unsupported device type in MPI allgather_base. Only CPU and CUDA are supported.");
++        }
++      };
++
++  // Enqueue the operation for execution and return the Work object
++  auto entry = std::make_unique<WorkEntry>(
++      &inputTensors,  // Pass address of input vector
++      &outputTensors, // Pass address of output vector
++      std::move(runFunc));
++
++  return enqueue(
++      std::move(entry),
++      "mpi:allgather_base",
++      std::optional<std::vector<at::Tensor>>({inputTensor}));
+ }
+ 
++
+ } // namespace c10d
+ 
+ #endif // USE_C10D_MPI
+diff --git a/torch/csrc/distributed/c10d/ProcessGroupMPI.hpp b/torch/csrc/distributed/c10d/ProcessGroupMPI.hpp
+index 5eb06b73955..f932c24eb73 100644
+--- a/torch/csrc/distributed/c10d/ProcessGroupMPI.hpp
++++ b/torch/csrc/distributed/c10d/ProcessGroupMPI.hpp
+@@ -16,6 +16,21 @@
+ #include <torch/csrc/distributed/c10d/Backend.hpp>
+ #include <torch/csrc/distributed/c10d/Types.hpp>
+ #include <torch/csrc/distributed/c10d/Utils.hpp>
++#include <torch/csrc/distributed/c10d/PrefixStore.hpp>
++#include <torch/csrc/distributed/c10d/Store.hpp>
++#include <torch/csrc/distributed/c10d/intra_node_comm.hpp>
++
++#include <c10/core/Stream.h>
++#include <c10/core/StreamGuard.h>
++#include <ATen/DynamicLibrary.h>
++
++#ifdef USE_CUDA
++#include <ATen/cuda/CUDAContext.h>
++#include <ATen/cuda/CUDAEvent.h>
++#include <c10/cuda/CUDACachingAllocator.h>
++#include <c10/cuda/CUDAGuard.h>
++#include <c10/cuda/CUDAStream.h>
++#endif
+ 
+ #include <c10/util/CallOnce.h>
+ 
+@@ -199,6 +214,11 @@ class TORCH_API ProcessGroupMPI : public Backend {
+       std::vector<std::vector<at::Tensor>>& inputTensors,
+       const ReduceScatterOptions& opts = ReduceScatterOptions()) override;
+ 
++  c10::intrusive_ptr<Work> _reduce_scatter_base(
++      at::Tensor& outputbuffer,
++      at::Tensor& inputbuffer,
++      const ReduceScatterOptions& opts = ReduceScatterOptions()) override;
++
+   c10::intrusive_ptr<Work> alltoall_base(
+       at::Tensor& outputTensor,
+       at::Tensor& inputTensor,
+diff --git a/torch/csrc/distributed/c10d/ProcessGroupUCC.cpp b/torch/csrc/distributed/c10d/ProcessGroupUCC.cpp
+index d52adada458..094a409703b 100644
+--- a/torch/csrc/distributed/c10d/ProcessGroupUCC.cpp
++++ b/torch/csrc/distributed/c10d/ProcessGroupUCC.cpp
+@@ -1,6 +1,5 @@
+ #ifdef USE_C10D_UCC
+ 
+-#include <ATen/cuda/nvrtc_stub/ATenNVRTC.h>
+ #include <torch/csrc/distributed/c10d/ProcessGroupUCC.hpp>
+ #include <torch/csrc/distributed/c10d/UCCTracing.hpp>
+ #include <torch/csrc/distributed/c10d/UCCUtils.hpp>
+@@ -528,13 +527,6 @@ void Comm::progress_loop() {
+ #ifdef USE_CUDA
+     if ((!device_set) && (cuda_device_index != TORCH_UCC_DEVICE_NOT_SET)) {
+       c10::cuda::set_device(cuda_device_index);
+-      CUcontext pctx = nullptr;
+-      at::globalContext().getNVRTC().cuCtxGetCurrent(&pctx);
+-      if (C10_UNLIKELY(!pctx)) {
+-        at::globalContext().getNVRTC().cuDevicePrimaryCtxRetain(
+-            &pctx, cuda_device_index);
+-        at::globalContext().getNVRTC().cuCtxSetCurrent(pctx);
+-      }
+       device_set = true;
+     }
+ #endif
+diff --git a/torch/utils/hipify/cuda_to_hip_mappings.py b/torch/utils/hipify/cuda_to_hip_mappings.py
+index 75dfd0ef316..d112e2b6618 100644
+--- a/torch/utils/hipify/cuda_to_hip_mappings.py
++++ b/torch/utils/hipify/cuda_to_hip_mappings.py
+@@ -8402,6 +8402,16 @@ CUDA_SPECIAL_MAP = collections.OrderedDict(
+         # gesvdj SetXXX
+         ('cusolverDnXgesvdjSetTolerance', ('hipsolverDnXgesvdjSetTolerance', CONV_MATH_FUNC, API_SPECIAL)),
+         ('cusolverDnXgesvdjSetMaxSweeps', ('hipsolverDnXgesvdjSetMaxSweeps', CONV_MATH_FUNC, API_SPECIAL)),
++        
++        # UCC
++        ('UCS_MEMORY_TYPE_CUDA', ('UCS_MEMORY_TYPE_ROCM', CONV_NUMERIC_LITERAL, API_SPECIAL)),
++        ('UCC_MEMORY_TYPE_CUDA', ('UCC_MEMORY_TYPE_ROCM', CONV_NUMERIC_LITERAL, API_SPECIAL)),
++        ('UCC_EE_CUDA_STREAM',   ('UCC_EE_ROCM_STREAM', CONV_NUMERIC_LITERAL, API_SPECIAL)),
++        
++        # MPI
++        ('MPIX_CUDA_AWARE_SUPPORT',   ('MPIX_ROCM_AWARE_SUPPORT', CONV_NUMERIC_LITERAL, API_SPECIAL)),
++        ('cudaAwareMpiCheck', ('rocmAwareMpiCheck', CONV_SPECIAL_FUNC, API_SPECIAL)),
++        ('MPIX_Query_cuda_support', ('MPIX_Query_rocm_support', CONV_DEVICE_FUNC, API_SPECIAL)),
+     ]
+ )
+ 
