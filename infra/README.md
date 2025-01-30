@@ -1,140 +1,130 @@
-# Distributed MLOps Infrastructure Project
+# Distributed processing-enabled MLOps Infrastructure
 
-This project provides a comprehensive infrastructure setup for distributed machine learning (ML) workloads on Kubernetes (K8s) using **Amazon EKS**. It includes Terraform modules for provisioning the infrastructure, Docker configurations for building custom images, and example scripts for running distributed training jobs using various frameworks and schedulers.
+This directory contains Terraform modules for provisioning MLOps-focused infrastructure in AWS. The modules support both EKS-based and EC2-based deployments, allowing you to choose the most suitable environment for your machine learning workloads.
 
-## Project Overview
+## Available Modules
 
-The project is organized into three main directories:
+### [EKS Module](`./eks/`)
 
-1. **[`infra/`](infra/)**: Contains Terraform modules for provisioning the EKS cluster, GPU support, and distributed training tools.
-2. **[`docker/`](docker/)**: Includes Docker configurations for building custom images for MPI, GPU, and distributed training workloads.
-3. **[`examples/`](examples)**: Provides example scripts and configurations for running distributed training jobs using:
-   - **Ray**
-   - **Torchrun**
-   - **MPI**
-   - **Training Operator**
-   - **Volcano Scheduler**
+A production-grade Kubernetes cluster optimized for ML workloads, featuring:
+- Managed node groups with GPU support (NVIDIA & AMD)
+- Comprehensive monitoring stack (Prometheus & Grafana)
+- MLOps tooling (Karpenter, Ray, Volcano scheduler)
+- Cost monitoring with Kubecost
+- Load balancing and ingress management
 
-## Directory Structure
+### [EC2 Module](`./ec2/`)
 
-```
-.
-├── docker/                     # Docker configurations for custom images
-│   ├── g4ad_rocm_build/        # AMD GPU (ROCm) build
-│   ├── g4dn_cuda_build/        # NVIDIA GPU (CUDA) build
-│   └── standard_mpi_runner/    # Standard MPI runner
-├── examples/                   # Example scripts and configurations
-│   ├── kuberay/                # Ray cluster examples
-│   ├── local/                  # Local distributed training examples
-│   ├── mpi/                    # MPI-based distributed training examples
-│   ├── ray/                    # Ray-based distributed training examples
-│   ├── torchrun/               # Torchrun-based distributed training examples
-│   ├── training_operator/      # Training Operator examples
-│   └── volcano_scheduler/      # Volcano Scheduler examples
-└── infra/                      # Terraform modules for EKS infrastructure
-    ├── ec2/                    # EC2 instance configurations
-    └── eks/                    # EKS cluster configurations
-```
-
-## Key Features
-
-- **EKS Cluster**: Fully managed Kubernetes cluster with GPU support.
-- **Distributed Training**: Support for Ray, Torchrun, MPI, Training Operator, and Volcano Scheduler.
-- **GPU Support**: Configurations for both NVIDIA (CUDA) and AMD (ROCm) GPUs.
-- **Monitoring**: Integrated Prometheus and Grafana for cluster monitoring.
-- **Cost Management**: Kubecost for cost monitoring and optimization.
-- **Automated Scaling**: Karpenter for dynamic node provisioning.
+Simulated local environments for ML development and testing, offering:
+- Single and multi-node configurations
+- Support for NVIDIA and AMD GPUs
+- MPI-ready setups for distributed training
+- Systems Manager (SSM) based access
+- Flexible instance type configurations
 
 ## Prerequisites
 
-To use this project, you need the following tools installed and configured:
+Before deploying either module, ensure you have the following tools and configurations in place:
 
-1. **Terraform** (>= 1.0): For provisioning infrastructure.
-2. **AWS CLI**: For interacting with AWS services.
-3. **kubectl**: For managing Kubernetes clusters.
-4. **Helm** (v3): For deploying Kubernetes applications.
-5. **Python**: For running distributed training scripts.
-
-## Getting Started
-
-### 1. **Set Up AWS CLI**
-   - Install the AWS CLI: [AWS CLI Installation Guide](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html).
-   - Configure your AWS credentials:
-     ```bash
-     aws configure
-     ```
-
-### 2. **Provision the Infrastructure**
-   - Navigate to the `infra/eks/` directory.
-   - Initialize Terraform:
-     ```bash
-     terraform init
-     ```
-   - Apply the Terraform configuration:
-     ```bash
-     terraform apply
-     ```
-
-### 3. **Configure kubectl**
-   - Update your `kubectl` configuration to connect to the EKS cluster:
-     ```bash
-     aws eks --region <region> update-kubeconfig --name <cluster-name>
-     ```
-
-### 4. **Deploy Distributed Training Jobs**
-   - Navigate to the `examples/` directory and choose the framework you want to use (e.g., Ray, Torchrun, MPI, Training Operator, or Volcano Scheduler).
-   - Follow the README in each subdirectory to deploy and run distributed training jobs.
-
-## Example Workflows
-
-### Running a Ray Job
-1. Navigate to `examples/ray/`.
-2. Follow the instructions in the `README.md` to deploy a Ray cluster and submit a job.
-
-### Running an MPI Job with Volcano Scheduler
-1. Navigate to `examples/volcano_scheduler/`.
-2. Update the `multinode_ddp_volcano_mpi_job.yaml` manifest with your training script.
-3. Submit the job:
-   ```bash
-   kubectl apply -f multinode_ddp_volcano_mpi_job.yaml
-   ```
-
-### Running a Training Operator Job
-1. Navigate to `examples/training_operator/`.
-2. Update the job manifest (e.g., `multinode_ddp_pytorch_job.yaml`) with your training script.
-3. Submit the job:
-   ```bash
-   kubectl apply -f multinode_ddp_pytorch_job.yaml
-   ```
-
-## Monitoring and Debugging
-
-- **Grafana Dashboard**:
-  ```bash
-  kubectl port-forward svc/kube-prometheus-stack-grafana 8080:80 -n kube-prometheus-stack
-  ```
-  Access at `http://localhost:8080`.
-
-- **Kubernetes Dashboard**:
-  ```bash
-  kubectl port-forward service/kubernetes-dashboard-kong-proxy -n kubernetes-dashboard 8443:443
-  ```
-  Access at `https://localhost:8443`.
-
-- **Job Status**:
-  Use `kubectl get jobs` or `kubectl get pods` to monitor the status of your jobs.
-
-## Cleanup
-
-To destroy the infrastructure and avoid unnecessary costs:
 ```bash
+# Required tools and versions
+terraform >= 1.0
+aws-cli >= 2.0
+kubectl >= 1.25    # For EKS deployments
+helm >= 3.0        # For EKS deployments
+```
+
+### AWS Configuration
+
+1. Configure AWS CLI with appropriate credentials:
+```bash
+aws configure
+```
+
+2. Verify your configuration:
+```bash
+aws sts get-caller-identity
+```
+
+## Deployment Instructions
+
+### 1. Variable Configuration
+
+Create a `terraform.tfvars` file in the respective module directory to set your variables:
+
+```hcl
+# terraform.tfvars example
+region = "us-west-2"
+owner  = "team-ml"
+
+# For EKS
+training_job_multinode_gpu_enabled = true
+ray_cluster_enabled = true
+
+# For EC2
+singlenode_multigpu = true
+multinode_gpu = false
+```
+
+### 2. Infrastructure Provisioning
+
+Navigate to the desired module directory and run:
+
+```bash
+# Initialize Terraform
+terraform init
+
+# Review the deployment plan
+terraform plan
+
+# Apply the configuration
+terraform apply
+```
+
+### 3. Post-deployment Steps
+
+For EKS deployments:
+```bash
+# Configure kubectl
+aws eks update-kubeconfig --region <region> --name <cluster_name>
+
+# Verify cluster access
+kubectl get nodes
+```
+
+For EC2 deployments:
+```bash
+# List instance IDs
+terraform output instance_ids
+
+# Connect via Session Manager
+aws ssm start-session --target <INSTANCE_ID>
+```
+
+### 4. Cleanup
+
+To destroy the infrastructure when no longer needed:
+
+```bash
+# Review destruction plan
+terraform plan -destroy
+
+# Destroy resources
 terraform destroy
 ```
 
-## References
+> **Note**: For EKS deployments, ensure all services and load balancers are properly removed before destroying the infrastructure to prevent orphaned AWS resources.
 
-- **Terraform Documentation**: [https://www.terraform.io/docs/](https://www.terraform.io/docs/)
-- **AWS EKS Documentation**: [https://docs.aws.amazon.com/eks/](https://docs.aws.amazon.com/eks/)
-- **Kubernetes Documentation**: [https://kubernetes.io/docs/](https://kubernetes.io/docs/)
-- **Ray Documentation**: [https://docs.ray.io/](https://docs.ray.io/)
-- **PyTorch Distributed Training**: [https://pytorch.org/tutorials/intermediate/ddp_tutorial.html](https://pytorch.org/tutorials/intermediate/ddp_tutorial.html)
+## Common Issues & Troubleshooting
+
+- If `terraform destroy` fails for EKS, check for remaining load balancers or persistent volumes
+- For EC2 deployments, ensure all instances are running before attempting SSM connections
+- AMD GPU instances require manual ROCm installation after deployment
+
+## Next Steps
+
+- Review the individual module READMEs for detailed configuration options
+- Check the deployment-specific security considerations
+- Configure monitoring and alerting for production deployments
+
+For detailed information about each module, refer to their respective README files in the `eks/` and `ec2/` directories.
