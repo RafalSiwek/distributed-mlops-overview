@@ -108,10 +108,20 @@ resources:
   requests:
     nvidia.com/gpu: 1
 ```
+And `tolerations`, as the [Karpenter provider sets specific taints](../../infra/eks/nodepools.tf):
+```yaml
+tolerations:
+  - effect: NoSchedule
+    key: nvidia.com/gpu
+    operator: Exists
+  - effect: NoSchedule
+    key: training-operator-job-gpu
+```
 
 ## Example Commands
 
 ### Submit a PyTorch Job
+
 ```bash
 kubectl apply -f multinode_ddp_pytorch_job.yaml
 ```

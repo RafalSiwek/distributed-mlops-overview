@@ -126,7 +126,7 @@ resource "kubectl_manifest" "training_operator_job_nodepool" {
 }
 
 #---------------------------------------------------------------------------
-# AMD GPU Training Operator NodePool - G4dn
+# NVIDIA GPU Training Operator NodePool - G4dn
 #---------------------------------------------------------------------------
 #---------------------------------------------------------------------------
 # Used for NVIDIA T4 GPU accelerated training operator jobs

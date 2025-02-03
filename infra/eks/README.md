@@ -166,11 +166,12 @@ aws eks get-token --cluster-name <cluster_name> --region <region>
 
 ## Limitations and Known Issues
 
-1. Public endpoint access is enabled by default (not recommended for production)
-2. Single NAT Gateway is used (consider multiple for production)
-3. AMD GPU support is limited to specific instance types
-4. Default monitoring retention periods may need adjustment for production use
-5. The Loadbalancer add-on provisions an AWS ELB, but Terraform does manage its cleanup - it has to be done manualy
+1. Cluster deployment takes around **30 min**
+2. Public endpoint access is enabled by default (not recommended for production)
+3. Single NAT Gateway is used (consider multiple for production)
+4. AMD GPU support is limited to specific instance types
+5. Default monitoring retention periods may need adjustment for production use
+6. The Loadbalancer add-on provisions an AWS ELB, but Terraform does manage its cleanup - it has to be done manualy
 
 ## License
 
