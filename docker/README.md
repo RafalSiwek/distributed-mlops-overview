@@ -85,9 +85,9 @@ When using MPI backend or running the code on AWS G4ad instances with unsupporte
     For NVIDIA G4dn
 
 3. Build PyTorch:
-    First patches need to be applied to support building with UCC and MPI:
+    First PyTorch source code needs to be patched to support building with UCC and MPI and the given AWS G4 instance GPU archs:
     ```bash
-    git apply pytorch_patches/pytorch_mpi_<GPU TYPE>.patch
+    git apply pytorch_patches/pytorch_mpi_aws_g4.patch
     ```
     For AMD GPUs first the code needs to be `hipified`:
     G4a:
